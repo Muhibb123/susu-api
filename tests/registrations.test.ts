@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   createRegistrationStore,
   MAX_LIVE_REGISTRATIONS,
@@ -215,5 +215,126 @@ describe('createRegistrationStore.register', () => {
       [USER_ONE],
     );
     expect(rows.rows[0]?.['live']).toBe(MAX_LIVE_REGISTRATIONS);
+  });
+});
+
+describe('one clock for the registration window', () => {
+  async function withApplicationClock<T>(now: number, run: () => Promise<T>): Promise<T> {
+    const spy = vi.spyOn(Date, 'now').mockReturnValue(now);
+    try {
+      return await run();
+    } finally {
+      spy.mockRestore();
+    }
+  }
+
+  /**
+   * The store, with a database that has its own clock.
+   *
+   * PGlite answers `now()` from the host clock, so offsetting the application's
+   * clock there offsets the database's as well and the difference between them —
+   * the whole of this bug — cannot be observed: both move together and every
+   * assertion about skew passes on the broken code too. This stands in for the
+   * store's database with a fixed answer to `now()`, while `Date.now` is an hour
+   * out, so the two disagree exactly as a skewed host would make them.
+   */
+  function databaseWithItsOwnClock(databaseNow: Date) {
+    const inserted: Array<{ expiresAt: Date }> = [];
+
+    // `queryChunks` is how drizzle carries the raw text of a `sql` template; it
+    // is nested one level in, so it is serialised rather than read precisely —
+    // this only has to tell one statement from another.
+    const text = (query: unknown): string =>
+      JSON.stringify((query as { queryChunks?: unknown[] }).queryChunks ?? []);
+
+    const select = (rows: unknown[]) => {
+      const chain = {
+        from: () => chain,
+        where: () => chain,
+        for: () => chain,
+        limit: () => chain,
+        then: (
+          onFulfilled: (value: unknown) => unknown,
+          onRejected: (reason: unknown) => unknown,
+        ) => Promise.resolve(rows).then(onFulfilled, onRejected),
+      };
+      return chain;
+    };
+
+    const insert = {
+      values: (values: { expiresAt: Date }) => {
+        inserted.push(values);
+        return {
+          onConflictDoNothing: () => ({
+            returning: () => ({
+              then: (
+                onFulfilled: (value: unknown) => unknown,
+                onRejected: (reason: unknown) => unknown,
+              ) => Promise.resolve([{ expiresAt: values.expiresAt }]).then(onFulfilled, onRejected),
+            }),
+          }),
+        };
+      },
+    };
+
+    const tx = {
+      execute: async (query: unknown) =>
+        text(query).includes('now() as now')
+          ? { rows: [{ now: databaseNow.toISOString() }] }
+          : { rows: [] },
+      select: () => select([]),
+      delete: () => ({
+        where: () => ({
+          then: (
+            onFulfilled: (value: unknown) => unknown,
+            onRejected: (reason: unknown) => unknown,
+          ) => Promise.resolve([]).then(onFulfilled, onRejected),
+        }),
+      }),
+      insert: () => insert,
+    };
+
+    return {
+      db: {
+        transaction: async <T>(run: (transaction: typeof tx) => Promise<T>): Promise<T> => run(tx),
+        select: () => select([]),
+      },
+      inserted,
+    };
+  }
+
+  it('takes the expiry from the database clock, not an application clock an hour out', async () => {
+    const databaseNow = new Date('2026-01-01T12:00:00.000Z');
+    const { db, inserted } = databaseWithItsOwnClock(databaseNow);
+    const skewedStore = createRegistrationStore(db as never);
+
+    const result = await withApplicationClock(databaseNow.getTime() + 60 * 60 * 1000, () =>
+      skewedStore.register({ contractId: GROUP_CONTRACT_ID, userId: USER_ONE }),
+    );
+
+    expect(result.outcome).toBe('registered');
+    expect(inserted).toHaveLength(1);
+
+    // The hour of skew in the application's clock does not reach the window: the
+    // expiry is `now() + TTL` of the server that also stamps `created_at`, so
+    // `group_registrations_window_positive` cannot be tripped by either clock
+    // running ahead of the other.
+    expect(inserted[0]?.expiresAt.getTime()).toBe(databaseNow.getTime() + REGISTRATION_TTL_MS);
+  });
+
+  it('stores a window of exactly the TTL, whatever the application clock says', async () => {
+    await store.register({ contractId: GROUP_CONTRACT_ID, userId: USER_ONE });
+
+    const rows = await testDb.query(
+      `select (expires_at > created_at) as in_window,
+              (expires_at - created_at between interval '29 minutes 55 seconds'
+                                                     and interval '30 minutes 5 seconds') as exact_window
+         from public.group_registrations where contract_id = $1`,
+      [GROUP_CONTRACT_ID],
+    );
+
+    expect(rows.rows[0]?.['in_window']).toBe(true);
+    expect(rows.rows[0]?.['exact_window']).toBe(true);
+    expect(await store.isRegistered(GROUP_CONTRACT_ID)).toBe(true);
   });
 });

@@ -98,6 +98,29 @@ export function createRegistrationStore(db: Database): RegistrationStore {
         // automatically.
         await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${userId}, 0))`);
 
+        // ONE CLOCK FOR THE WHOLE WINDOW.
+        // `expires_at` used to be written from the application clock —
+        // `Date.now() + TTL` — while every comparison of it (the live-row read
+        // below, the expired-row delete after it, `isRegistered`) and `created_at`
+        // itself came from the database's `now()`. Two clocks means the window is
+        // measured against a different one than it was written with: an
+        // application running minutes behind set `expires_at` before
+        // `created_at` and tripped `group_registrations_window_positive`, which
+        // turned a registration into a 500, and one running ahead silently
+        // stretched or shrank every claim by the skew. The clock is read once
+        // here, from the server that owns every other timestamp in this table, so
+        // the value written, the value compared, and the value returned all agree.
+        const clock = (await tx.execute(sql`select now() as now`)) as unknown as {
+          // A driver may hand `timestamptz` back as a `Date` or as its ISO text;
+          // both are the server's answer, which is the point.
+          rows: Array<{ now: Date | string }>;
+        };
+        const databaseNow = new Date(clock.rows[0]?.now ?? '');
+        if (Number.isNaN(databaseNow.getTime())) {
+          throw new Error('the database reported no clock.');
+        }
+        const expiresAt = new Date(databaseNow.getTime() + REGISTRATION_TTL_MS);
+
         const live = await tx
           .select({ contractId: groupRegistrations.contractId })
           .from(groupRegistrations)
@@ -122,8 +145,6 @@ export function createRegistrationStore(db: Database): RegistrationStore {
               lte(groupRegistrations.expiresAt, sql`now()`),
             ),
           );
-
-        const expiresAt = new Date(Date.now() + REGISTRATION_TTL_MS);
 
         // The cap is checked against the claim being *replaced*, so re-registering
         // an address an account already holds is never refused for being at the
